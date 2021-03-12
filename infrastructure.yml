@@ -7,8 +7,13 @@ Description:
 #Metadata:
 #  template metadata
 
-#Parameters:
-#  set of parameters
+Parameters:
+  Application:
+    Type: String
+    Description: Application name e.g. bwrs.
+  Environment:
+    Type: String
+    Description: Environment name e.g. prod, dev.
 
 #Rules:
 #  set of rules
@@ -23,7 +28,19 @@ Description:
 #  set of transforms
 
 Resources:
-#  set of resources
+  ECSCluster:
+    Type: 'AWS::ECS::Cluster'
+    Properties:
+      ClusterName:
+        !Join
+          - '-'
+          - - !Ref Application
+            - !Ref Environment
+      CapacityProviders:
+        - FARGATE
+      DefaultCapacityProviderStrategy:
+        - CapacityProvider: FARGATE
+          Weight: 1
 
-Outputs:
+#Outputs:
 #  set of outputs
