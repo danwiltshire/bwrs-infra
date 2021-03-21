@@ -1,8 +1,7 @@
 #!/bin/bash -e
 
-# Usage: ./deploy.sh [prod/dev/etc]
+# Provide AWS profiles within ~/.aws/config e.g.
 #
-# ~/.aws/config
 #   [default]
 #       region = eu-west-1
 #   [profile prod]

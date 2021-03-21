@@ -57,8 +57,8 @@ Resources:
       VpcId: !Ref VPCID
       SecurityGroupIngress:
         - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
+          FromPort: 443
+          ToPort: 443
           CidrIp: !Ref AllowedTrafficCidrIp
       Tags:
         - Key: Name
@@ -86,6 +86,28 @@ Resources:
         - Key: Application
           Value: !Ref Application
 
+  DatabaseSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Database access
+      VpcId: !Ref VPCID
+      Tags:
+        - Key: Name
+          Value: !Join [ '-', [ !Ref AWS::StackName, 'db', 'sg' ] ]
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref Application
+
+  DatabaseSecurityGroupIngress:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref DatabaseSecurityGroup
+      IpProtocol: tcp
+      FromPort: !GetAtt Database.Endpoint.Port
+      ToPort: !GetAtt Database.Endpoint.Port
+      SourceSecurityGroupId: !Ref ContainerSecurityGroup
+
 
   #
   # Certificates
@@ -98,19 +120,31 @@ Resources:
         !Join
           - '.'
           - - !Ref Application
-            - !Sub
-              - "{{resolve:ssm:/dwlab/${Environment}/root-domain-name:1}}"
-              - { Environment: !Ref Environment }
+            - !Sub "{{resolve:ssm:/dwlab/${Environment}/root-domain-name:1}}"
       DomainValidationOptions:
         - DomainName: !Join
           - '.'
           - - !Ref Application
-            - !Sub
-              - "{{resolve:ssm:/dwlab/${Environment}/root-domain-name:1}}"
-              - { Environment: !Ref Environment }
-          HostedZoneId: !Sub
-            - "{{resolve:ssm:/dwlab/${Environment}/root-domain-hosted-zone-id:2}}"
-            - { Environment: !Ref Environment }
+            - !Sub "{{resolve:ssm:/dwlab/${Environment}/root-domain-name:1}}"
+          HostedZoneId: !Sub "{{resolve:ssm:/dwlab/${Environment}/root-domain-hosted-zone-id:2}}"
+
+
+  #
+  # DNS
+  #
+  DNSRecord:
+    Type: AWS::Route53::RecordSet
+    Properties:
+      HostedZoneId: !Sub "{{resolve:ssm:/dwlab/${Environment}/root-domain-hosted-zone-id:2}}"
+      Name:
+        !Join
+          - '.'
+          - - !Ref Application
+            - !Sub "{{resolve:ssm:/dwlab/${Environment}/root-domain-name:1}}"
+      ResourceRecords:
+        - !GetAtt LoadBalancer.DNSName
+      TTL: 900
+      Type: CNAME
 
 
   #
@@ -140,16 +174,70 @@ Resources:
 
 
   #
+  # Secrets
+  #
+  DatabaseMasterCredentials:
+    Type: 'AWS::SecretsManager::Secret'
+    Properties:
+      Name: !Sub "/dwlab/${Environment}/database-master-credentials"
+      Description: "This secret has a dynamically generated secret password."
+      GenerateSecretString:
+        SecretStringTemplate: '{"username": "admin"}'
+        GenerateStringKey: "password"
+        PasswordLength: 30
+        ExcludeCharacters: \'"@/\$,[]*?{}~%\<>()|^;:#!`
+      Tags:
+          - Key: Environment
+            Value: !Ref Environment
+          - Key: Application
+            Value: !Ref Application
+
+
+  #
+  # Secret attachments
+  #
+  DatabaseMasterCredentialsAttachment:
+    Type: "AWS::SecretsManager::SecretTargetAttachment"
+    Properties:
+      SecretId: !Ref DatabaseMasterCredentials
+      TargetId: !Ref Database
+      TargetType: AWS::RDS::DBInstance
+
+
+  #
+  # Database
+  #
+  Database:
+    Type: 'AWS::RDS::DBInstance'
+    Properties:
+      DBName: !Join [ '', [ !Ref Application, !Ref Environment, 'db' ] ]
+      DBInstanceClass: db.t3.micro
+      AllocatedStorage: '20'
+      StorageType: gp2 # SSD
+      StorageEncrypted: true
+      Engine: MySQL
+      EngineVersion: 5.7.31
+      VPCSecurityGroups:
+        - !Ref DatabaseSecurityGroup
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DatabaseMasterCredentials}::username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DatabaseMasterCredentials}::password}}'
+      #DeletionProtection: true
+      MultiAZ: true
+      PubliclyAccessible: false
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: !Ref Application
+
+
+  #
   # Container compute (ECS Fargate)
   #
   ECSCluster:
     Type: 'AWS::ECS::Cluster'
     Properties:
-      ClusterName:
-        !Join
-          - '-'
-          - - !Ref Application
-            - !Ref Environment
+      ClusterName: !Join [ '-', [ !Ref AWS::StackName, 'cluster' ] ]
       CapacityProviders:
         - FARGATE
       DefaultCapacityProviderStrategy:
@@ -178,18 +266,32 @@ Resources:
           Essential: true
           PortMappings:
             - ContainerPort: 80
+          Environment:
+            - Name: DATABASE_URL
+              Value:
+                !Sub
+                  - "mysql://${DatabaseUsername}:${DatabasePassword}@${DatabaseHost}:${DatabasePort}/${DatabaseName}"
+                  - DatabaseUsername: !Sub '{{resolve:secretsmanager:${DatabaseMasterCredentials}::username}}'
+                    DatabasePassword: !Sub '{{resolve:secretsmanager:${DatabaseMasterCredentials}::password}}'
+                    DatabaseHost: !GetAtt Database.Endpoint.Address
+                    DatabasePort: !GetAtt Database.Endpoint.Port
+                    DatabaseName: !Join [ '', [ !Ref Application, !Ref Environment, 'db' ] ]
+            - Name: RUST_BACKTRACE
+              Value: '1'
+            - Name: EXTENDED_LOGGING
+              Value: 'true'
           MountPoints: 
-          - SourceVolume: "bwrs-data"
+          - SourceVolume: !Join [ '-', [ !Ref AWS::StackName, 'vol', 'data' ] ]
             ContainerPath: "/data"
           LogConfiguration:
             LogDriver: awslogs
             Options:
               awslogs-group: !Ref CloudWatchLogsGroup
               awslogs-region: !Ref AWS::Region
-              awslogs-stream-prefix: !Ref AWS::StackName
+              awslogs-stream-prefix: 'container'
       NetworkMode: awsvpc
       Volumes: 
-        - Name: "bwrs-data"
+        - Name: !Join [ '-', [ !Ref AWS::StackName, 'vol', 'data' ] ]
           EFSVolumeConfiguration:
             FilesystemId: !Ref FileSystemResource
             TransitEncryption: 'ENABLED'
@@ -206,7 +308,7 @@ Resources:
     Properties:
       Cluster: 
         Ref: ECSCluster
-      DesiredCount: 0
+      DesiredCount: 1
       TaskDefinition:
         Ref: ECSTaskDefinition
       LaunchType: FARGATE
@@ -217,7 +319,7 @@ Resources:
           SecurityGroups:
             - !Ref ContainerSecurityGroup
       LoadBalancers:
-        - ContainerName: bwrs
+        - ContainerName: !Ref Application
           ContainerPort: 80
           TargetGroupArn: !Ref TargetGroup
       Tags:
@@ -275,6 +377,10 @@ Resources:
   TargetGroup:
     Type: AWS::ElasticLoadBalancingV2::TargetGroup
     Properties:
+      # Specify a dynamic name to avoid error 'target groups cannot be associated with more than one load balancer'
+      # When changing AWS::ElasticLoadBalancingV2::Listener properties.  When the Listener has to be replaced,
+      # This resource will be too because we're referencing LoadBalancerName.
+      Name: !Join [ '-', [ !GetAtt LoadBalancer.LoadBalancerName, 'tg' ] ]
       HealthCheckIntervalSeconds: 10
       HealthCheckPath: '/alive'
       HealthCheckTimeoutSeconds: 5
@@ -297,13 +403,15 @@ Resources:
         - TargetGroupArn: !Ref TargetGroup
           Type: forward
       LoadBalancerArn: !Ref LoadBalancer
-      Port: 80
-      Protocol: HTTP
+      Certificates:
+        - CertificateArn: !Ref HTTPSCertificate
+      Port: 443
+      Protocol: HTTPS
+      SslPolicy: ELBSecurityPolicy-FS-1-2-Res-2020-10
 
   LoadBalancer:
     Type: AWS::ElasticLoadBalancingV2::LoadBalancer
     Properties:
-      Name: bwrs-lb
       Scheme: internet-facing
       SecurityGroups:
         - !Ref LoadBalancerSecurityGroup
